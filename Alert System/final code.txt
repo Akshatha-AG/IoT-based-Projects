@@ -1,0 +1,276 @@
+#include <Wire.h>
+
+#include <ESP8266WiFi.h>
+#include <SoftwareSerial.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+const char* ssid = "";
+const char* password = "";
+
+// Twilio credentials
+const char* twilio_account_sid = "";
+const char* twilio_auth_token = "";
+const char* twilio_from_number = "";  // Your Twilio number
+const char* destination_number = ""; // Your phone number (with +91)
+
+SoftwareSerial gpsSerial(12, 13); // RX, TX pins for GPS module
+WiFiClientSecure client;
+
+String latitude = "";
+String longitude = "";
+
+// Pulse sensor on A0 pin
+const int pulsePin = A0;
+
+// Temperature sensor DS18B20 on D4 (GPIO2)
+#define ONE_WIRE_BUS 2
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// Push button on D3 (GPIO0)
+const int buttonPin = 0;
+
+// Variables for pulse and temperature
+int pulseValue = 0;
+float temperature = 0.0;
+
+// Thresholds
+const int pulseThreshold = 800;         // Adjust as needed
+const float temperatureThreshold = 220.0; // Celsius
+bool alertSent = false;  // To prevent alert spamming
+
+unsigned long lastButtonPress = 0;
+const unsigned long debounceDelay = 10000; // 10 seconds debounce to prevent spamming SMS
+
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(9600);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" connected!");
+
+  client.setInsecure();  // For testing only — in production, validate the certificate
+
+  sensors.begin();
+  pinMode(buttonPin, INPUT_PULLUP);  // Internal pull-up for button
+}
+
+void loop() {
+  pulseValue = analogRead(pulsePin);
+  sensors.requestTemperatures();
+  temperature = sensors.getTempCByIndex(0);
+
+  Serial.print("Pulse Value: ");
+  Serial.print(pulseValue);
+  Serial.print(" | Temperature: ");
+  Serial.println(temperature);
+
+  if (digitalRead(buttonPin) == LOW) {
+    if (millis() - lastButtonPress > debounceDelay) {
+      Serial.println("Button pressed, sending SMS and making call...");
+      getGPSLocation();
+      sendSmsWithVitalsAndLocation();
+      makeEmergencyCall();
+      lastButtonPress = millis();
+      alertSent = true;
+    }
+  }
+
+  if ((pulseValue > pulseThreshold || temperature > temperatureThreshold) && !alertSent) {
+    Serial.println("Threshold exceeded, sending SMS and making call...");
+    getGPSLocation();
+    sendSmsWithVitalsAndLocation();
+    makeEmergencyCall();
+    alertSent = true;
+    lastButtonPress = millis();
+  }
+
+  if (millis() - lastButtonPress > debounceDelay) {
+    alertSent = false;
+  }
+
+  delay(1000);
+}
+
+void getGPSLocation() {
+  Serial.println("Reading GPS data...");
+  long start = millis();
+  while (millis() - start < 5000) {
+    if (gpsSerial.available()) {
+      String line = gpsSerial.readStringUntil('\n');
+      if (line.startsWith("$GPGGA")) {
+        parseGPGGA(line);
+        if (latitude != "" && longitude != "") {
+          Serial.println("GPS Location: " + latitude + ", " + longitude);
+          break;
+        }
+      }
+    }
+  }
+}
+
+void parseGPGGA(String gpgga) {
+  int index1 = gpgga.indexOf(',');
+  int index2 = gpgga.indexOf(',', index1 + 1);
+  int index3 = gpgga.indexOf(',', index2 + 1);
+  int index4 = gpgga.indexOf(',', index3 + 1);
+  int index5 = gpgga.indexOf(',', index4 + 1);
+
+  String rawLat = gpgga.substring(index2 + 1, index3);
+  String ns = gpgga.substring(index3 + 1, index4);
+  String rawLon = gpgga.substring(index4 + 1, index5);
+  String ew = gpgga.substring(index5 + 1, index5 + 2);
+
+  latitude = convertToDecimalDegrees(rawLat, ns);
+  longitude = convertToDecimalDegrees(rawLon, ew);
+}
+
+String convertToDecimalDegrees(String rawDegrees, String direction) {
+  if (rawDegrees.length() < 6) return "";
+
+  float deg, min;
+  if (direction == "N" || direction == "S") {
+    deg = rawDegrees.substring(0, 2).toFloat();
+    min = rawDegrees.substring(2).toFloat();
+  } else {
+    deg = rawDegrees.substring(0, 3).toFloat();
+    min = rawDegrees.substring(3).toFloat();
+  }
+
+  float decDeg = deg + (min / 60.0);
+  if (direction == "S" || direction == "W") decDeg = -decDeg;
+
+  return String(decDeg, 6);
+}
+
+void sendSmsWithVitalsAndLocation() {
+  if (latitude == "" || longitude == "") {
+    Serial.println("No GPS fix, cannot send SMS.");
+    return;
+  }
+
+  String message = "\xF0\x9F\x9A\xA8 SOS Alert!\n";
+  message += "Location: https://maps.google.com/?q=" + latitude + "," + longitude + "\n";
+  message += "Pulse Sensor Value: " + String(pulseValue) + "\n";
+  message += "Temperature: " + String(temperature, 2) + " Â \xC2° \xC2\xB0C";
+
+  Serial.println("Sending SMS: " + message);
+
+  if (!client.connect("api.twilio.com", 443)) {
+    Serial.println("Connection to Twilio failed!");
+    return;
+  }
+
+  String auth = base64Encode(String(twilio_account_sid) + ":" + String(twilio_auth_token));
+
+  String postData = "From=" + urlEncode(twilio_from_number) +
+                    "&To=" + urlEncode(destination_number) +
+                    "&Body=" + urlEncode(message);
+
+  client.println("POST /2010-04-01/Accounts/" + String(twilio_account_sid) + "/Messages.json HTTP/1.1");
+  client.println("Host: api.twilio.com");
+  client.println("Authorization: Basic " + auth);
+  client.println("Content-Type: application/x-www-form-urlencoded");
+  client.print("Content-Length: ");
+  client.println(postData.length());
+  client.println();
+  client.println(postData);
+
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+
+  String response = client.readString();
+  Serial.println("Response from Twilio: ");
+  Serial.println(response);
+
+  client.stop();
+}
+
+void makeEmergencyCall() {
+  if (!client.connect("api.twilio.com", 443)) {
+    Serial.println("Connection to Twilio failed for call!");
+    return;
+  }
+
+  String url = "https://handler.twilio.com/twiml/EH5949d0c46cd509031689ce28d3ffdf2e"; // Replace with your TwiML Bin URL
+  String postData = "From=" + urlEncode(twilio_from_number) +
+                    "&To=" + urlEncode(destination_number) +
+                    "&Url=" + urlEncode(url);
+
+  String auth = base64Encode(String(twilio_account_sid) + ":" + String(twilio_auth_token));
+
+  client.println("POST /2010-04-01/Accounts/" + String(twilio_account_sid) + "/Calls.json HTTP/1.1");
+  client.println("Host: api.twilio.com");
+  client.println("Authorization: Basic " + auth);
+  client.println("Content-Type: application/x-www-form-urlencoded");
+  client.print("Content-Length: ");
+  client.println(postData.length());
+  client.println();
+  client.println(postData);
+
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+
+  String response = client.readString();
+  Serial.println("Call response from Twilio:");
+  Serial.println(response);
+
+  client.stop();
+}
+
+String base64Encode(String input) {
+  const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String output = "";
+  int val = 0, valb = -6;
+  for (unsigned char c : input) {
+    val = (val << 8) + c;
+    valb += 8;
+    while (valb >= 0) {
+      output += base64_chars[(val >> valb) & 0x3F];
+      valb -= 6;
+    }
+  }
+  if (valb > -6) output += base64_chars[((val << 8) >> (valb + 8)) & 0x3F];
+  while (output.length() % 4) output += '=';
+  return output;
+}
+
+String urlEncode(String str) {
+  String encodedString = "";
+  char c;
+  char code0;
+  char code1;
+  for (int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encodedString += c;
+    } else if (c == ' ') {
+      encodedString += '+';
+    } else if (c == '+') {
+      encodedString += "%2B";
+    } else {
+      code1 = (c & 0xf);
+      if (code1 > 9) code1 = code1 - 10 + 'A';
+      else code1 += '0';
+      code0 = ((c >> 4) & 0xf);
+      if (code0 > 9) code0 = code0 - 10 + 'A';
+      else code0 += '0';
+      encodedString += '%';
+      encodedString += (char)code0;
+      encodedString += (char)code1;
+    }
+  }
+  return encodedString;
+}
